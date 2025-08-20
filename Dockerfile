@@ -1,11 +1,24 @@
-FROM python:3.9-slim
-# Set the working directory
+FROM python:3.11-slim
+
 WORKDIR /app
-# Copy the application code
-COPY . /app
-# Install dependencies
-RUN pip install --no-cache-dir --upgrade pip && \ pip install --no-cache-dir -r requirements.txt  \
-# Expose the FastAPI port (DO automatically detects this)
-EXPOSE 8000
-# Command to run the app
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+
+# Postgres build deps (safe even if using psycopg2-binary)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential libpq-dev \
+ && rm -rf /var/lib/apt/lists/*
+
+# Install deps first for caching
+COPY requirements.txt .
+RUN pip install --no-cache-dir --upgrade pip \
+ && pip install --no-cache-dir -r requirements.txt
+
+# Copy app
+COPY . .
+
+ENV PYTHONUNBUFFERED=1
+
+# DO probes $PORT; default 8080 locally
+EXPOSE 8080
+
+# ✅ Start command: Gunicorn with Uvicorn workers, binding to $PORT
+CMD ["bash", "-lc", "gunicorn -k uvicorn.workers.UvicornWorker -w 2 -b 0.0.0.0:${PORT:-8080} main:app"]
