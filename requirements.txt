@@ -2,7 +2,7 @@ fastapi
 uvicorn[standard]
 gunicorn
 sqlalchemy>=2.0
-psycopg[binary]>=3.1
+psycopg2-binary==2.9.9
 python-dotenv
 pydantic[email]
 stripe==10.11.0
