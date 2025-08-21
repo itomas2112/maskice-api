@@ -32,13 +32,6 @@ DATABASE_URL = f'postgresql://{username}:{password}@{host}:{port}/{database}?ssl
 stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
 FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "http://localhost:3000")
 
-
-ALLOWED_ORIGINS = [
-    "http://localhost:3000",
-    "http://localhost:5173",
-    "http://localhost:5174",
-]
-
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
@@ -177,10 +170,7 @@ app = FastAPI(title="Maskino API", version="1.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
+        "*",
     ],
     allow_credentials=True,
     allow_methods=["*"],
