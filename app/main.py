@@ -409,16 +409,57 @@ def create_checkout_session(payload: CheckoutPayload):
     items = payload.items
     customer = payload.customer
 
-    out_items, subtotal, prod_snap, prod_index = validate_and_price(items)
+    # 1) Validate & compute pricing
+    out_items, subtotal, _prod_snap, prod_index = validate_and_price(items)
     if not out_items:
         raise HTTPException(status_code=400, detail="Cart is empty.")
 
     shipping = compute_shipping(subtotal)
     total = subtotal + shipping
 
-    # ... create order as above (use per-variant image when saving OrderItem)
+    # 2) Create the Order and OrderItems (with per-variant images)
+    with SessionLocal() as db:
+        order = Order(
+            status="PENDING",
+            currency="EUR",
+            subtotal_cents=subtotal,
+            shipping_cents=shipping,
+            total_cents=total,
+            customer_first_name=customer.first_name,
+            customer_last_name=customer.last_name,
+            customer_email=customer.email,
+            ship_address_line1=customer.address.line1,
+            ship_address_line2=customer.address.line2,
+            ship_city=customer.address.city,
+            ship_postal_code=customer.address.postal_code,
+            ship_country=customer.address.country,
+        )
+        db.add(order)
+        db.flush()  # get order.id
+        order_id = order.id
 
-    # 2) Build Stripe line items with the chosen variant image
+        for qi in out_items:
+            idx = prod_index[qi.product_id]
+            image = (
+                idx["img_by_variant"].get((qi.color, qi.model)) or
+                idx["img_by_color"].get(qi.color) or
+                idx["any_image"]
+            )
+            db.add(OrderItem(
+                order_id=order_id,
+                product_id=qi.product_id,
+                product_name=qi.name,
+                image=image,
+                color=qi.color,
+                model=qi.model,
+                qty=qi.qty,
+                unit_price_cents=qi.unit_price_cents,
+                line_total_cents=qi.line_total_cents,
+            ))
+
+        db.commit()
+
+    # 3) Build Stripe line items (use per-variant images). Ensure images are full HTTPS URLs.
     line_items = []
     for qi in out_items:
         idx = prod_index[qi.product_id]
@@ -427,13 +468,17 @@ def create_checkout_session(payload: CheckoutPayload):
             idx["img_by_color"].get(qi.color) or
             idx["any_image"]
         )
+        product_data = {
+            "name": f"{qi.name} — {qi.model} — {qi.color}",
+        }
+        # Only include image if it looks like a full URL; Stripe requires this.
+        if isinstance(image, str) and image.startswith(("http://", "https://")):
+            product_data["images"] = [image]
+
         line_items.append({
             "price_data": {
                 "currency": "eur",
-                "product_data": {
-                    "name": f"{qi.name} — {qi.model} — {qi.color}",
-                    "images": [image],
-                },
+                "product_data": product_data,
                 "unit_amount": qi.unit_price_cents,
             },
             "quantity": qi.qty,
@@ -449,26 +494,25 @@ def create_checkout_session(payload: CheckoutPayload):
             "quantity": 1,
         })
 
-    # 3) Create Stripe Checkout Session
+    # 4) Create Stripe Checkout Session
+    # Note: idempotency_key is supported in stripe-python as a request option.
     session = stripe.checkout.Session.create(
         mode="payment",
         success_url=f"{FRONTEND_ORIGIN}/success?order_id={order_id}",
         cancel_url=f"{FRONTEND_ORIGIN}/cancel?order_id={order_id}",
         line_items=line_items,
-        metadata={"order_id": order_id},       # keep order_id in metadata
-        idempotency_key=order_id,              # makes retries safe
+        metadata={"order_id": order_id},
         allow_promotion_codes=True,
-        customer_email=customer.email,         # prefill email
-        # If you prefer Stripe to collect the shipping address too, you can enable:
-        # shipping_address_collection={"allowed_countries": [customer.address.country]},
+        customer_email=customer.email,
+        idempotency_key=order_id,
     )
 
-    # 4) Store Stripe IDs on the order
+    # 5) Persist stripe_session_id (payment_intent may still be None at this stage)
     with SessionLocal() as db:
         db_order = db.get(Order, order_id)
         if db_order:
             db_order.stripe_session_id = session.id
-            db_order.payment_intent_id = session.get("payment_intent")
+            # Don't set payment_intent here; set it in webhook after completion
             db.commit()
 
     return {"checkout_url": session.url, "order_id": order_id}
