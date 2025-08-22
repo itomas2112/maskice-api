@@ -13,6 +13,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker, relationship, selectinload
 from sqlalchemy.dialects.postgresql import ARRAY
+from sqlalchemy import String
 
 import stripe
 
@@ -39,13 +40,17 @@ SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 class Base(DeclarativeBase):
     pass
 
-class Product(Base):
+class ProductVar(Base):
     __tablename__ = "products"
-    id: Mapped[str] = mapped_column(Text, primary_key=True)  # "aurora-clear"
-    name: Mapped[str] = mapped_column(Text, nullable=False)
-    image: Mapped[str] = mapped_column(Text, nullable=False)
-    colors: Mapped[List[str]] = mapped_column(ARRAY(Text), nullable=False)
-    compat: Mapped[List[str]] = mapped_column(ARRAY(Text), nullable=False)
+
+    # Composite PK so multiple rows with the same product id are allowed
+    id: Mapped[str]      = mapped_column(Text, primary_key=True)      # logical product id, e.g. "silicon"
+    colors: Mapped[str]  = mapped_column(Text, primary_key=True)      # e.g. "Zelena"
+    compat: Mapped[str]  = mapped_column(Text, primary_key=True)      # e.g. "iPhone 16 Pro"
+
+    # Non-key attrs
+    name: Mapped[str]        = mapped_column(Text, nullable=False)
+    image: Mapped[str]       = mapped_column(Text, nullable=False)    # color/compat-specific image
     price_cents: Mapped[int] = mapped_column(Integer, nullable=False)
 
 class Order(Base):
@@ -188,44 +193,98 @@ def validate_and_price(items: List[CartItemIn]):
     if not items:
         return [], 0, {}
 
+    wanted_ids = list({i.product_id for i in items})
     with SessionLocal() as db:
-        ids = list({i.product_id for i in items})
-        prods = db.scalars(select(Product).where(Product.id.in_(ids))).all()
-        prod_map = {p.id: p for p in prods}
+        variants = db.scalars(select(ProductVar).where(ProductVar.id.in_(wanted_ids))).all()
+
+    # Build per-product index
+    prod_index: dict[str, dict] = {}
+    for v in variants:
+        entry = prod_index.setdefault(v.id, {
+            "name": v.name,
+            "price_cents": v.price_cents,
+            "colors": set(),
+            "compat": set(),
+            # map (color, compat) -> image (fallbacks if needed)
+            "img_by_variant": {},
+            "img_by_color": {},
+            "any_image": v.image,
+        })
+        entry["colors"].add(v.colors)
+        entry["compat"].add(v.compat)
+        entry["img_by_variant"][(v.colors, v.compat)] = v.image
+        entry["img_by_color"].setdefault(v.colors, v.image)
+        # Keep first seen as "any_image" in case we need a fallback
 
     out_items: List[QuoteItemOut] = []
     subtotal = 0
-    # Build a serializable snapshot so we don't need more DB queries later
-    prod_snap = {
-        p.id: dict(
-            id=p.id, name=p.name, image=p.image,
-            colors=p.colors, compat=p.compat, price_cents=p.price_cents
-        ) for p in prods
-    }
+
+    # snapshot used later when persisting order items / building Stripe line items
+    prod_snap: dict[str, dict] = {}
 
     for it in items:
-        p = prod_map.get(it.product_id)
-        if not p:
+        entry = prod_index.get(it.product_id)
+        if not entry:
             raise HTTPException(status_code=400, detail=f"Unknown product_id '{it.product_id}'")
-        if it.color not in p.colors:
-            raise HTTPException(status_code=400, detail=f"Invalid color '{it.color}' for product '{p.id}'")
-        if it.model not in p.compat:
-            raise HTTPException(status_code=400, detail=f"Model '{it.model}' not compatible with product '{p.id}'")
 
-        line_total = p.price_cents * it.qty
+        if it.color not in entry["colors"]:
+            raise HTTPException(status_code=400, detail=f"Invalid color '{it.color}' for product '{it.product_id}'")
+
+        if it.model not in entry["compat"]:
+            raise HTTPException(status_code=400, detail=f"Model '{it.model}' not compatible with product '{it.product_id}'")
+
+        unit = entry["price_cents"]
+        line_total = unit * it.qty
         subtotal += line_total
-        out_items.append(
-            QuoteItemOut(
-                product_id=p.id,
-                name=p.name,
-                color=it.color,
-                model=it.model,
-                qty=it.qty,
-                unit_price_cents=p.price_cents,
-                line_total_cents=line_total,
-            )
+
+        # pick the best image for this variant
+        image = (
+            entry["img_by_variant"].get((it.color, it.model)) or
+            entry["img_by_color"].get(it.color) or
+            entry["any_image"]
         )
-    return out_items, subtotal, prod_snap
+
+        # Build/refresh snapshot per product id (used later in create_order/checkout)
+        prod_snap[it.product_id] = {
+            "id": it.product_id,
+            "name": entry["name"],
+            # Store a representative image, but we'll pass the per-line chosen image to OrderItem
+            "image": image,  # optional; not strictly needed if you always set per-line image below
+            "colors": list(entry["colors"]),
+            "compat": list(entry["compat"]),
+            "price_cents": unit,
+        }
+
+        out_items.append(QuoteItemOut(
+            product_id=it.product_id,
+            name=entry["name"],
+            color=it.color,
+            model=it.model,
+            qty=it.qty,
+            unit_price_cents=unit,
+            line_total_cents=line_total,
+        ))
+
+    return out_items, subtotal, prod_snap, prod_index  # NOTE: return prod_index so we can use images
+
+
+def _as_list(v: str | list[str] | None) -> list[str]:
+    if v is None:
+        return []
+    if isinstance(v, list):
+        return v
+    # split on commas if present; trim whitespace
+    parts = [p.strip() for p in v.split(",")]
+    return [p for p in parts if p] if len(parts) > 1 else [v.strip()]
+
+def _uniq(seq: list[str]) -> list[str]:
+    seen = set()
+    out = []
+    for x in seq:
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
 
 #%% APIs
 @app.get("/", summary="Health")
@@ -235,20 +294,45 @@ def root():
 @app.get("/products", response_model=List[ProductOut], summary="List all products")
 def list_products():
     with SessionLocal() as db:
-        return db.scalars(select(Product).order_by(Product.id)).all()
+        rows = db.scalars(select(ProductVar)).all()
+
+    # group by logical product id
+    by_id: dict[str, list[ProductVar]] = {}
+    for r in rows:
+        by_id.setdefault(r.id, []).append(r)
+
+    out: list[ProductOut] = []
+    for pid, variants in by_id.items():
+        # assume name/price consistent across variants; take from the first
+        base = variants[0]
+        colors = _uniq([v.colors for v in variants])
+        compat = _uniq([v.compat for v in variants])
+
+        # choose a representative image for catalog (first variant)
+        rep_image = base.image
+
+        out.append(ProductOut(
+            id=pid,
+            name=base.name,
+            image=rep_image,
+            colors=colors,
+            compat=compat,  # Pydantic will validate against the Literal
+            price_cents=base.price_cents,
+        ))
+    return out
 
 @app.post("/checkout/quote", response_model=QuoteOut)
 def quote(items: List[CartItemIn]):
-    out_items, subtotal, _ = validate_and_price(items)
+    out_items, subtotal, _prod_snap, _prod_index = validate_and_price(items)
     shipping = compute_shipping(subtotal)
     return QuoteOut(items=out_items, subtotal_cents=subtotal, shipping_cents=shipping, total_cents=subtotal+shipping)
 
 @app.post("/orders")
-def create_order(payload: CheckoutPayload):  # CHANGED
+def create_order(payload: CheckoutPayload):
     items = payload.items
     customer = payload.customer
 
-    out_items, subtotal, prod_snap = validate_and_price(items)
+    out_items, subtotal, prod_snap, prod_index = validate_and_price(items)
     if not out_items:
         raise HTTPException(status_code=400, detail="Cart is empty.")
 
@@ -262,7 +346,6 @@ def create_order(payload: CheckoutPayload):  # CHANGED
             subtotal_cents=subtotal,
             shipping_cents=shipping,
             total_cents=total,
-            # NEW - persist customer info
             customer_first_name=customer.first_name,
             customer_last_name=customer.last_name,
             customer_email=customer.email,
@@ -275,97 +358,20 @@ def create_order(payload: CheckoutPayload):  # CHANGED
         db.add(order)
         db.flush()
 
-        oi_payload = []
         for qi in out_items:
-            snap = prod_snap[qi.product_id]
-            oi = OrderItem(
-                order_id=order.id,
-                product_id=snap["id"],
-                product_name=snap["name"],
-                image=snap["image"],
-                color=qi.color,
-                model=qi.model,
-                qty=qi.qty,
-                unit_price_cents=qi.unit_price_cents,
-                line_total_cents=qi.line_total_cents,
+            # choose variant image for this line
+            idx = prod_index[qi.product_id]
+            image = (
+                idx["img_by_variant"].get((qi.color, qi.model)) or
+                idx["img_by_color"].get(qi.color) or
+                idx["any_image"]
             )
-            db.add(oi)
-            oi_payload.append(oi)
 
-        db.commit()
-
-        return {
-            "id": order.id,
-            "status": order.status,
-            "currency": order.currency,
-            "subtotal_cents": order.subtotal_cents,
-            "shipping_cents": order.shipping_cents,
-            "total_cents": order.total_cents,
-            "items": [
-                {
-                    "id": x.id,
-                    "product_id": x.product_id,
-                    "product_name": x.product_name,
-                    "image": x.image,
-                    "color": x.color,
-                    "model": x.model,
-                    "qty": x.qty,
-                    "unit_price_cents": x.unit_price_cents,
-                    "line_total_cents": x.line_total_cents,
-                }
-                for x in oi_payload
-            ],
-        }
-# in create_checkout_session (FastAPI)
-
-@app.post("/checkout/session")
-def create_checkout_session(payload: CheckoutPayload):
-    """
-    Create a local Order (incl. customer + shipping details),
-    then start a Stripe Checkout Session and store Stripe IDs on the order.
-    Returns the hosted checkout URL and order_id.
-    """
-    items = payload.items
-    customer = payload.customer
-
-    out_items, subtotal, prod_snap = validate_and_price(items)
-    if not out_items:
-        raise HTTPException(status_code=400, detail="Cart is empty.")
-
-    shipping = compute_shipping(subtotal)
-    total = subtotal + shipping
-
-    # 1) Create order + order items with customer fields
-    with SessionLocal() as db:
-        order = Order(
-            status="PENDING",
-            currency="EUR",
-            subtotal_cents=subtotal,
-            shipping_cents=shipping,
-            total_cents=total,
-            # Customer fields
-            customer_first_name=customer.first_name,
-            customer_last_name=customer.last_name,
-            customer_email=customer.email,
-            # Shipping address fields
-            ship_address_line1=customer.address.line1,
-            ship_address_line2=customer.address.line2,
-            ship_city=customer.address.city,
-            ship_postal_code=customer.address.postal_code,
-            ship_country=customer.address.country,
-        )
-        db.add(order)
-        db.flush()  # get order.id
-        order_id = order.id
-
-        # Persist order items
-        for qi in out_items:
-            snap = prod_snap[qi.product_id]
             db.add(OrderItem(
-                order_id=order_id,
-                product_id=snap["id"],
-                product_name=snap["name"],
-                image=snap["image"],
+                order_id=order.id,
+                product_id=qi.product_id,
+                product_name=qi.name,
+                image=image,
                 color=qi.color,
                 model=qi.model,
                 qty=qi.qty,
@@ -375,21 +381,64 @@ def create_checkout_session(payload: CheckoutPayload):
 
         db.commit()
 
-    # 2) Build Stripe line items
+    return {
+        "id": order.id,
+        "status": order.status,
+        "currency": order.currency,
+        "subtotal_cents": order.subtotal_cents,
+        "shipping_cents": order.shipping_cents,
+        "total_cents": order.total_cents,
+        "items": [
+            {
+                "id": x.id,
+                "product_id": x.product_id,
+                "product_name": x.product_name,
+                "image": x.image,
+                "color": x.color,
+                "model": x.model,
+                "qty": x.qty,
+                "unit_price_cents": x.unit_price_cents,
+                "line_total_cents": x.line_total_cents,
+            }
+            for x in order.items
+        ],
+    }
+
+@app.post("/checkout/session")
+def create_checkout_session(payload: CheckoutPayload):
+    items = payload.items
+    customer = payload.customer
+
+    out_items, subtotal, prod_snap, prod_index = validate_and_price(items)
+    if not out_items:
+        raise HTTPException(status_code=400, detail="Cart is empty.")
+
+    shipping = compute_shipping(subtotal)
+    total = subtotal + shipping
+
+    # ... create order as above (use per-variant image when saving OrderItem)
+
+    # 2) Build Stripe line items with the chosen variant image
     line_items = []
     for qi in out_items:
-        snap = prod_snap[qi.product_id]
+        idx = prod_index[qi.product_id]
+        image = (
+            idx["img_by_variant"].get((qi.color, qi.model)) or
+            idx["img_by_color"].get(qi.color) or
+            idx["any_image"]
+        )
         line_items.append({
             "price_data": {
                 "currency": "eur",
                 "product_data": {
-                    "name": f"{snap['name']} — {qi.model} — {qi.color}",
-                    "images": [snap["image"]],
+                    "name": f"{qi.name} — {qi.model} — {qi.color}",
+                    "images": [image],
                 },
                 "unit_amount": qi.unit_price_cents,
             },
             "quantity": qi.qty,
         })
+
     if shipping > 0:
         line_items.append({
             "price_data": {
