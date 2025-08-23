@@ -44,15 +44,17 @@ class Base(DeclarativeBase):
 class ProductVar(Base):
     __tablename__ = "products"
 
-    # Composite PK so multiple rows with the same product id are allowed
-    id: Mapped[str]      = mapped_column(Text, primary_key=True)      # logical product id, e.g. "silicon"
-    colors: Mapped[str]  = mapped_column(Text, primary_key=True)      # e.g. "Zelena"
-    compat: Mapped[str]  = mapped_column(Text, primary_key=True)      # e.g. "iPhone 16 Pro"
+    # PK
+    id: Mapped[str]      = mapped_column(Text, primary_key=True)
+    colors: Mapped[str]  = mapped_column(Text, primary_key=True)
+    compat: Mapped[str]  = mapped_column(Text, primary_key=True)
 
-    # Non-key attrs
+    # Attributes
     name: Mapped[str]        = mapped_column(Text, nullable=False)
-    image: Mapped[str]       = mapped_column(Text, nullable=False)    # color/compat-specific image
+    image: Mapped[str]       = mapped_column(Text, nullable=False)
     price_cents: Mapped[int] = mapped_column(Integer, nullable=False)
+    type: Mapped[str | None]  = mapped_column(Text, nullable=True)   # e.g. "Case"
+    phone: Mapped[str | None] = mapped_column(Text, nullable=True)   # e.g. "iPhone"
 
 class Order(Base):
     __tablename__ = "orders"
@@ -181,6 +183,8 @@ class ProductByCompatOut(BaseModel):
     compat: CompatType
     price_cents: int
     variants: List[ProductVariantOut]
+    type: str | None = None
+    phone: str | None = None
 
 app = FastAPI(title="Maskino API", version="1.0.0")
 
@@ -316,24 +320,20 @@ def list_products(compat: CompatType | None = Query(default=None, description="O
         q = select(ProductVar)
         if compat:
             q = q.where(ProductVar.compat == compat)
-        # Deterministic order helps debugging
         q = q.order_by(ProductVar.name, ProductVar.compat, ProductVar.colors)
         rows = db.scalars(q).all()
 
-    # Group by (name, compat), NOT by DB id
     grouped: dict[tuple[str, str], list[ProductVar]] = {}
     for r in rows:
         grouped.setdefault((r.name, r.compat), []).append(r)
 
     out: list[ProductByCompatOut] = []
     for (name_key, compat_key), variants in grouped.items():
-        # Assume consistent price per product name; take the first
         base = variants[0]
         price = base.price_cents
 
         color_to_variant: dict[str, tuple[str, str]] = {}
         for v in variants:
-            # cast DB id to string so it matches ProductVariantOut
             color_to_variant.setdefault(v.colors, (v.image, str(v.id)))
 
         out.append(ProductByCompatOut(
@@ -345,6 +345,8 @@ def list_products(compat: CompatType | None = Query(default=None, description="O
                 ProductVariantOut(product_id=db_id, colors=c, image=img)
                 for c, (img, db_id) in color_to_variant.items()
             ],
+            type=base.type,
+            phone=base.phone,
         ))
 
     return out
