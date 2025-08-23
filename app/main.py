@@ -171,7 +171,8 @@ class CheckoutPayload(BaseModel):
     customer: CustomerIn
 
 class ProductVariantOut(BaseModel):
-    colors: str          # <-- column is "colors"
+    product_id: str
+    colors: str
     image: str
 
 class ProductByCompatOut(BaseModel):
@@ -330,19 +331,19 @@ def list_products(compat: CompatType | None = Query(default=None, description="O
         base = variants[0]
         price = base.price_cents
 
-        # Deduplicate by color; keep first image seen for a color
-        color_to_image: dict[str, str] = {}
+        color_to_variant: dict[str, tuple[str, str]] = {}
         for v in variants:
-            color_to_image.setdefault(v.colors, v.image)   # <-- column is "colors"
+            # cast DB id to string so it matches ProductVariantOut
+            color_to_variant.setdefault(v.colors, (v.image, str(v.id)))
 
         out.append(ProductByCompatOut(
-            id=f"{_slugify(name_key)}--{_slugify(compat_key)}",  # stable, not DB id
+            id=f"{_slugify(name_key)}--{_slugify(compat_key)}",
             name=name_key,
-            compat=compat_key,                                   # validated by CompatType
+            compat=compat_key,
             price_cents=price,
             variants=[
-                ProductVariantOut(colors=c, image=img)
-                for c, img in color_to_image.items()
+                ProductVariantOut(product_id=db_id, colors=c, image=img)
+                for c, (img, db_id) in color_to_variant.items()
             ],
         ))
 
