@@ -1,8 +1,9 @@
 # main.py
 import os, uuid
 from typing import List, Literal
+import re
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, conint
 from dotenv import load_dotenv
@@ -169,6 +170,17 @@ class CheckoutPayload(BaseModel):
     items: List[CartItemIn]
     customer: CustomerIn
 
+class ProductVariantOut(BaseModel):
+    colors: str          # <-- column is "colors"
+    image: str
+
+class ProductByCompatOut(BaseModel):
+    id: str
+    name: str
+    compat: CompatType
+    price_cents: int
+    variants: List[ProductVariantOut]
+
 app = FastAPI(title="Maskino API", version="1.0.0")
 
 
@@ -286,39 +298,54 @@ def _uniq(seq: list[str]) -> list[str]:
             out.append(x)
     return out
 
+def _slugify(s: str) -> str:
+    s = s.lower()
+    s = re.sub(r'[^a-z0-9]+', '-', s)
+    return s.strip('-')
+
 #%% APIs
 @app.get("/", summary="Health")
 def root():
     return {"message": "OK"}
 
-@app.get("/products", response_model=List[ProductOut], summary="List all products")
-def list_products():
+@app.get("/products", response_model=List[ProductByCompatOut],
+         summary="List products grouped by (name, compat) with color variants")
+def list_products(compat: CompatType | None = Query(default=None, description="Optional phone filter")):
     with SessionLocal() as db:
-        rows = db.scalars(select(ProductVar)).all()
+        q = select(ProductVar)
+        if compat:
+            q = q.where(ProductVar.compat == compat)
+        # Deterministic order helps debugging
+        q = q.order_by(ProductVar.name, ProductVar.compat, ProductVar.colors)
+        rows = db.scalars(q).all()
 
-    # group by logical product id
-    by_id: dict[str, list[ProductVar]] = {}
+    # Group by (name, compat), NOT by DB id
+    grouped: dict[tuple[str, str], list[ProductVar]] = {}
     for r in rows:
-        by_id.setdefault(r.id, []).append(r)
+        grouped.setdefault((r.name, r.compat), []).append(r)
 
-    out: list[ProductOut] = []
-    for pid, variants in by_id.items():
-        # assume name/price consistent across variants; take from the first
+    out: list[ProductByCompatOut] = []
+    for (name_key, compat_key), variants in grouped.items():
+        # Assume consistent price per product name; take the first
         base = variants[0]
-        colors = _uniq([v.colors for v in variants])
-        compat = _uniq([v.compat for v in variants])
+        price = base.price_cents
 
-        # choose a representative image for catalog (first variant)
-        rep_image = base.image
+        # Deduplicate by color; keep first image seen for a color
+        color_to_image: dict[str, str] = {}
+        for v in variants:
+            color_to_image.setdefault(v.colors, v.image)   # <-- column is "colors"
 
-        out.append(ProductOut(
-            id=pid,
-            name=base.name,
-            image=rep_image,
-            colors=colors,
-            compat=compat,  # Pydantic will validate against the Literal
-            price_cents=base.price_cents,
+        out.append(ProductByCompatOut(
+            id=f"{_slugify(name_key)}--{_slugify(compat_key)}",  # stable, not DB id
+            name=name_key,
+            compat=compat_key,                                   # validated by CompatType
+            price_cents=price,
+            variants=[
+                ProductVariantOut(colors=c, image=img)
+                for c, img in color_to_image.items()
+            ],
         ))
+
     return out
 
 @app.post("/checkout/quote", response_model=QuoteOut)
