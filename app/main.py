@@ -10,9 +10,6 @@ from sqlalchemy.exc import IntegrityError
 import boto3  # ← add
 from botocore.client import Config  # ← add
 
-import boto3  # ← add
-from botocore.client import Config  # ← add
-
 from fastapi import FastAPI, HTTPException, Request, Query, Path
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, conint
