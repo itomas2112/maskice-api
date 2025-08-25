@@ -2,9 +2,14 @@
 import os, uuid, mimetypes
 from typing import List, Literal, Optional
 import re
+from datetime import datetime, timedelta, timezone
 
-from fastapi import FastAPI, HTTPException, Request, Query, Path, UploadFile, File, Form, Body  # ← add UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, Request, Query, Path, UploadFile, File, Form, Body, Header  # ← add UploadFile, File, Form
 from sqlalchemy.exc import IntegrityError
+
+from sqlalchemy import select as sa_select
+
+from enum import Enum as PyEnum
 
 
 import boto3  # ← add
@@ -19,9 +24,9 @@ from pydantic import EmailStr  # top of file
 from sqlalchemy import (
     create_engine, Text, Integer, DateTime, select, func as sa_func, ForeignKey
 )
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker, relationship, selectinload
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker, relationship, selectinload, aliased
 from sqlalchemy.dialects.postgresql import ARRAY
-from sqlalchemy import String, cast
+from sqlalchemy import String, cast, Index, Enum, and_, or_, update
 
 import stripe
 
@@ -80,6 +85,7 @@ class ProductVar(Base):
     price_cents: Mapped[int] = mapped_column(Integer, nullable=False)
     type: Mapped[str | None]  = mapped_column(Text, nullable=True)   # e.g. "Case"
     phone: Mapped[str | None] = mapped_column(Text, nullable=True)   # e.g. "iPhone"
+    quantity: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
 
 class Order(Base):
     __tablename__ = "orders"
@@ -234,6 +240,7 @@ class ProductVariantOut(BaseModel):
     product_id: str
     colors: str
     image: str
+    quantity: int
 
 class ProductRowIn(BaseModel):
     id: str | None = None
@@ -253,6 +260,9 @@ class ProductByCompatOut(BaseModel):
     variants: List[ProductVariantOut]
     type: str | None = None
     phone: str | None = None
+    # optional: sum of variant quantities for this (name, compat) group
+    total_quantity: int | None = None
+
 
 class TypeOut(BaseModel):
     name: str
@@ -277,6 +287,24 @@ class SubphoneIn(BaseModel):
     phone: str
     name: str
 
+class ReservationState(str, PyEnum):
+    HELD = "HELD"
+    COMMITTED = "COMMITTED"
+    RELEASED = "RELEASED"
+
+class StockReservation(Base):
+    __tablename__ = "stock_reservations"
+    id: Mapped[str] = mapped_column(Text, primary_key=True, default=lambda: str(uuid.uuid4()))
+    order_id: Mapped[str] = mapped_column(Text, ForeignKey("orders.id", ondelete="CASCADE"), nullable=False)
+
+    product_id: Mapped[str] = mapped_column(Text, nullable=False)
+    color: Mapped[str] = mapped_column(Text, nullable=False)
+    model: Mapped[str] = mapped_column(Text, nullable=False)  # compat value
+    qty: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    state: Mapped[str] = mapped_column(Text, nullable=False, default="HELD", server_default="HELD")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=sa_func.now())
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 app = FastAPI(title="Maskino API", version="1.0.0")
 
@@ -426,6 +454,70 @@ def _upload_to_spaces(file_bytes: bytes, key: str, content_type: str):
         CacheControl="public, max-age=31536000, immutable",
     )
 
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+RES_HOLD_MINUTES = int(os.getenv("RES_HOLD_MINUTES", "15"))
+
+Index("ix_reservations_active", StockReservation.product_id, StockReservation.color, StockReservation.model, StockReservation.state, StockReservation.expires_at)
+
+def release_expired_reservations(db):
+    """Return stock for any HELD reservations past expires_at, then mark them RELEASED.
+       Do this inside a transaction before new reservations/quotes."""
+    # Find all expired HELD reservations
+    expired = db.scalars(
+        sa_select(StockReservation)
+        .where(
+            StockReservation.state == "HELD",
+            StockReservation.expires_at <= now_utc()
+        )
+        .with_for_update(skip_locked=True)
+    ).all()
+    if not expired:
+        return
+
+    # Aggregate to minimize UPDATEs per ProductVar row
+    by_key: dict[tuple[str,str,str], int] = {}
+    for r in expired:
+        by_key[(r.product_id, r.color, r.model)] = by_key.get((r.product_id, r.color, r.model), 0) + r.qty
+
+    # Return stock
+    for (pid, color, model), qty in by_key.items():
+        pv = db.get(ProductVar, {"id": pid, "colors": color, "compat": model})
+        if pv:
+            # lock the row
+            db.execute(
+                sa_select(ProductVar)
+                .where(
+                    ProductVar.id == pid,
+                    ProductVar.colors == color,
+                    ProductVar.compat == model
+                )
+                .with_for_update()
+            )
+            pv.quantity = pv.quantity + qty
+
+    # Mark reservations RELEASED
+    for r in expired:
+        r.state = "RELEASED"
+    # Commit happens in the caller's transaction
+
+def ensure_user_reservation_limits(db, email: str | None, ip: str | None, max_active_items: int = 10):
+    # Count active HELD reservations tied to pending orders for this email or IP
+    q = sa_select(sa_func.coalesce(sa_func.sum(StockReservation.qty), 0)).join(Order,
+                                                                               Order.id == StockReservation.order_id).where(
+        StockReservation.state == "HELD",
+        Order.status == "PENDING",
+        or_(
+            and_(email is not None, Order.customer_email == email),
+            and_(ip is not None, Order.ship_address_line1 == None, True)
+            # replace with your own IP storage if you keep it
+        )
+    )
+    active_qty = db.scalar(q) or 0
+    if active_qty > max_active_items:
+        raise HTTPException(status_code=429, detail="Too many active holds. Complete or wait for holds to expire.")
+
 
 #%% APIs
 @app.get("/", summary="Health")
@@ -451,9 +543,13 @@ def list_products(compat: CompatType | None = Query(default=None, description="O
         base = variants[0]
         price = base.price_cents
 
-        color_to_variant: dict[str, tuple[str, str]] = {}
+        # map color -> (image, db_id, quantity)
+        color_to_variant: dict[str, tuple[str, str, int]] = {}
         for v in variants:
-            color_to_variant.setdefault(v.colors, (v.image, str(v.id)))
+            # last write wins per color; if you prefer first write, check with setdefault only if color not in dict
+            color_to_variant[v.colors] = (v.image, str(v.id), int(v.quantity or 0))
+
+        total_qty = sum(q for (_, _, q) in color_to_variant.values())
 
         out.append(ProductByCompatOut(
             id=f"{_slugify(name_key)}--{_slugify(compat_key)}",
@@ -461,15 +557,17 @@ def list_products(compat: CompatType | None = Query(default=None, description="O
             compat=compat_key,
             price_cents=price,
             variants=[
-                ProductVariantOut(product_id=db_id, colors=c, image=img)
-                for c, (img, db_id) in color_to_variant.items()
+                ProductVariantOut(product_id=db_id, colors=c, image=img, quantity=qty)
+                for c, (img, db_id, qty) in color_to_variant.items()
             ],
             type=base.type,
             phone=base.phone,
+            total_quantity=total_qty,  # NEW (optional, you already had the field)
         ))
 
     return out
 
+# --- CREATE ONE PRODUCT VARIANT (supports file upload or image_url) ---
 @app.post("/product", summary="Create ONE product row (drag&drop upload or URL)")
 async def create_single_product_multipart(
     id: str | None = Form(None),
@@ -481,34 +579,36 @@ async def create_single_product_multipart(
     phone: str | None = Form(None),
     image: UploadFile | None = File(None),
     image_url: str | None = Form(None),
+    quantity: conint(ge=0) = Form(0),   # NEW
 ):
     if not image and not image_url:
         raise HTTPException(status_code=400, detail="Provide either image file or image_url")
 
-    saved_url: str
+    # Upload (or accept URL)
     if image:
         file_bytes = await image.read()
         key = _spaces_key_for(name, image.filename)
         _upload_to_spaces(file_bytes, key, _guess_content_type(image.filename))
         saved_url = _public_url_for(key)
     else:
-        saved_url = image_url  # trust frontend if you pass a full https URL
+        saved_url = image_url  # trust full https URL from frontend
 
     with SessionLocal() as db:
+        # If id is not provided, auto-increment the numeric id space as string
         if not id:
-            # get max id and increment
             max_id = db.scalar(select(cast(ProductVar.id, Integer)).order_by(cast(ProductVar.id, Integer).desc()))
-            next_id = (max_id or 0) + 1
-            id = str(next_id)
+            id = str((max_id or 0) + 1)
+
         row = ProductVar(
             id=id,
             name=name,
             image=saved_url,
             colors=colors,
             compat=compat,
-            price_cents=price_cents,
+            price_cents=int(price_cents),
             type=type,
             phone=phone,
+            quantity=int(quantity),   # NEW
         )
         db.add(row)
         try:
@@ -523,21 +623,24 @@ async def create_single_product_multipart(
     return {
         "status": "created",
         "id": id,
+        "name": name,
         "colors": colors,
         "compat": compat,
+        "price_cents": int(price_cents),
+        "type": type,
+        "phone": phone,
         "image": saved_url,
+        "quantity": int(quantity),  # NEW
     }
 
-@app.patch(
-    "/product/{id}/{colors}/{compat}",
-    summary="Update ONE product row (by composite key); optionally replace image"
-)
+# --- UPDATE ONE PRODUCT VARIANT (by composite key) ---
+@app.patch("/product/{id}/{colors}/{compat}", summary="Update ONE product row (by composite key); optionally replace image")
 async def update_product_variant(
     id: str = Path(...),
     colors: str = Path(...),
     compat: CompatType = Path(...),
 
-    # Optional fields to update — all via multipart so we can also accept an image upload
+    # Optional fields (multipart) so we can also accept an image upload
     name: Optional[str] = Form(None),
     price_cents: Optional[conint(ge=0)] = Form(None),
     type: Optional[str] = Form(None),
@@ -546,6 +649,9 @@ async def update_product_variant(
     # Image replacement (either upload or URL); if neither given, image is left as-is
     image: UploadFile | None = File(None),
     image_url: str | None = Form(None),
+
+    # NEW: stock update
+    quantity: Optional[conint(ge=0)] = Form(None),
 ):
     with SessionLocal() as db:
         row = db.get(ProductVar, {"id": id, "colors": colors, "compat": compat})
@@ -570,8 +676,9 @@ async def update_product_variant(
             row.type = type
         if phone is not None:
             row.phone = phone
+        if quantity is not None:            # NEW
+            row.quantity = int(quantity)
 
-        # (Deliberately not updating id/colors/compat since those are PK)
         db.commit()
 
         return {
@@ -584,7 +691,9 @@ async def update_product_variant(
             "type": row.type,
             "phone": row.phone,
             "image": row.image,
+            "quantity": row.quantity,       # NEW
         }
+
 
 @app.delete(
     "/product/{id}/{colors}/{compat}",
@@ -737,20 +846,24 @@ def mark_order_complete(order_id: str = Path(..., description="Order ID")):
         return {"ok": True, "order_id": order_id, "complete": 1}
 
 @app.post("/checkout/session")
-def create_checkout_session(payload: CheckoutPayload):
+def create_checkout_session(payload: CheckoutPayload, request: Request, x_forwarded_for: str | None = Header(None)):
     items = payload.items
     customer = payload.customer
 
-    # 1) Validate & compute pricing
+    # 1) Validate & compute pricing (no stock check here)
     out_items, subtotal, _prod_snap, prod_index = validate_and_price(items)
     if not out_items:
         raise HTTPException(status_code=400, detail="Cart is empty.")
-
     shipping = compute_shipping(subtotal)
     total = subtotal + shipping
 
-    # 2) Create the Order and OrderItems (with per-variant images)
+    client_ip = (x_forwarded_for.split(",")[0].strip() if x_forwarded_for else (request.client.host if request.client else None))
+
+    # 2) Create Order and place stock reservations atomically
     with SessionLocal() as db:
+        # free any expired holds before we compute availability
+        release_expired_reservations(db)
+
         order = Order(
             status="PENDING",
             currency="EUR",
@@ -767,15 +880,58 @@ def create_checkout_session(payload: CheckoutPayload):
             ship_country=customer.address.country,
         )
         db.add(order)
-        db.flush()  # get order.id
+        db.flush()
         order_id = order.id
 
+        # Optional: anti-abuse limiter
+        try:
+            ensure_user_reservation_limits(db, email=customer.email, ip=client_ip, max_active_items=10)
+        except HTTPException:
+            db.rollback()
+            raise
+
+        # For each line: lock row, check qty, decrement, add reservation + order item
         for qi in out_items:
+            # lock the variant row
+            pv_row = db.execute(
+                sa_select(ProductVar)
+                .where(
+                    ProductVar.id == qi.product_id,
+                    ProductVar.colors == qi.color,
+                    ProductVar.compat == qi.model
+                )
+                .with_for_update()
+            ).scalar_one_or_none()
+            if not pv_row:
+                db.rollback()
+                raise HTTPException(status_code=400, detail=f"Variant not found for {qi.product_id} / {qi.color} / {qi.model}")
+
+            # ensure stock
+            if pv_row.quantity < qi.qty:
+                db.rollback()
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Out of stock for {qi.product_id} ({qi.model} / {qi.color}). Available={pv_row.quantity}, requested={qi.qty}"
+                )
+
+            # decrement stock and create reservation
+            pv_row.quantity = pv_row.quantity - qi.qty
+            db.add(StockReservation(
+                order_id=order_id,
+                product_id=qi.product_id,
+                color=qi.color,
+                model=qi.model,
+                qty=qi.qty,
+                state="HELD",
+                expires_at=now_utc() + timedelta(minutes=RES_HOLD_MINUTES),
+            ))
+
+            # choose image for this line (as you already do)
             idx = prod_index[qi.product_id]
             image = (
-                idx["img_by_variant"].get((qi.color, qi.model)) or
-                idx["img_by_color"].get(qi.color) or
-                idx["any_image"]
+                idx["img_by_variant"].get((qi.color, qi.model))
+                or idx["img_by_color"].get(qi.color)
+                or idx["any_image"]
             )
             db.add(OrderItem(
                 order_id=order_id,
@@ -791,22 +947,18 @@ def create_checkout_session(payload: CheckoutPayload):
 
         db.commit()
 
-    # 3) Build Stripe line items (use per-variant images). Ensure images are full HTTPS URLs.
+    # 3) Create Stripe session (same as you had)
     line_items = []
     for qi in out_items:
         idx = prod_index[qi.product_id]
         image = (
-            idx["img_by_variant"].get((qi.color, qi.model)) or
-            idx["img_by_color"].get(qi.color) or
-            idx["any_image"]
+            idx["img_by_variant"].get((qi.color, qi.model))
+            or idx["img_by_color"].get(qi.color)
+            or idx["any_image"]
         )
-        product_data = {
-            "name": f"{qi.name} — {qi.model} — {qi.color}",
-        }
-        # Only include image if it looks like a full URL; Stripe requires this.
+        product_data = { "name": f"{qi.name} — {qi.model} — {qi.color}" }
         if isinstance(image, str) and image.startswith(("http://", "https://")):
             product_data["images"] = [image]
-
         line_items.append({
             "price_data": {
                 "currency": "eur",
@@ -815,7 +967,6 @@ def create_checkout_session(payload: CheckoutPayload):
             },
             "quantity": qi.qty,
         })
-
     if shipping > 0:
         line_items.append({
             "price_data": {
@@ -826,8 +977,6 @@ def create_checkout_session(payload: CheckoutPayload):
             "quantity": 1,
         })
 
-    # 4) Create Stripe Checkout Session
-    # Note: idempotency_key is supported in stripe-python as a request option.
     session = stripe.checkout.Session.create(
         mode="payment",
         success_url=f"{FRONTEND_ORIGIN}/success?order_id={order_id}",
@@ -839,12 +988,10 @@ def create_checkout_session(payload: CheckoutPayload):
         idempotency_key=order_id,
     )
 
-    # 5) Persist stripe_session_id (payment_intent may still be None at this stage)
     with SessionLocal() as db:
         db_order = db.get(Order, order_id)
         if db_order:
             db_order.stripe_session_id = session.id
-            # Don't set payment_intent here; set it in webhook after completion
             db.commit()
 
     return {"checkout_url": session.url, "order_id": order_id}
@@ -873,20 +1020,46 @@ async def stripe_webhook(request: Request):
                     order.status = "COMPLETED"
                     order.payment_intent_id = pi_id
                     order.stripe_session_id = session_id
+                    # Mark reservations COMMITTED
+                    db.execute(
+                        update(StockReservation)
+                        .where(
+                            StockReservation.order_id == order_id,
+                            StockReservation.state == "HELD"
+                        )
+                        .values(state="COMMITTED")
+                    )
                     db.commit()
 
-    elif etype in ("checkout.session.expired",):
+    elif etype in ("checkout.session.expired", "payment_intent.payment_failed"):
         order_id = (data.get("metadata") or {}).get("order_id")
         if order_id:
             with SessionLocal() as db:
+                # If the order is still PENDING, mark CANCELED
                 order = db.get(Order, order_id)
                 if order and order.status == "PENDING":
                     order.status = "CANCELED"
-                    db.commit()
-
-    # (Optional) handle payment_intent.payment_failed if you use PaymentIntents directly
+                # Proactively release any HELD reservations for this order (don’t wait for lazy cleaner)
+                held = db.scalars(
+                    sa_select(StockReservation)
+                    .where(StockReservation.order_id==order_id, StockReservation.state=="HELD")
+                    .with_for_update(skip_locked=True)
+                ).all()
+                for r in held:
+                    pv = db.get(ProductVar, {"id": r.product_id, "colors": r.color, "compat": r.model})
+                    if pv:
+                        # lock pv
+                        db.execute(
+                            sa_select(ProductVar)
+                            .where(ProductVar.id==r.product_id, ProductVar.colors==r.color, ProductVar.compat==r.model)
+                            .with_for_update()
+                        )
+                        pv.quantity = pv.quantity + r.qty
+                    r.state = "RELEASED"
+                db.commit()
 
     return {"received": True}
+
 
 # --- Small helper to query order status (optional but handy for success page) ---
 @app.get("/orders/{order_id}")
