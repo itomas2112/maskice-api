@@ -133,6 +133,19 @@ class OrderItem(Base):
 
     order: Mapped[Order] = relationship(back_populates="items")
 
+class CartItem(Base):
+    __tablename__ = "cart_items"
+
+    cart_id:    Mapped[str] = mapped_column(Text, primary_key=True)   # 32-char cookie/header
+    product_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    color:      Mapped[str] = mapped_column(Text, primary_key=True)
+    model:      Mapped[str] = mapped_column(Text, primary_key=True)   # CompatType values
+    qty:        Mapped[int] = mapped_column(Integer, nullable=False)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=sa_func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=sa_func.now(), onupdate=sa_func.now())
+
+
 # ---------- Lookup tables ----------
 class TypeRow(Base):
     __tablename__ = "types"
@@ -263,6 +276,18 @@ class ProductByCompatOut(BaseModel):
     # optional: sum of variant quantities for this (name, compat) group
     total_quantity: int | None = None
 
+class CartItemPatch(BaseModel):
+    action: Literal["add", "set", "remove"]
+    product_id: str
+    color: str
+    model: CompatType
+    qty: conint(ge=0, le=100) = 0  # for add/set; 0 with "set" removes
+
+class CartOut(BaseModel):
+    items: List[QuoteItemOut]
+    subtotal_cents: int
+    shipping_cents: int
+    total_cents: int
 
 class TypeOut(BaseModel):
     name: str
@@ -517,6 +542,22 @@ def ensure_user_reservation_limits(db, email: str | None, ip: str | None, max_ac
     active_qty = db.scalar(q) or 0
     if active_qty > max_active_items:
         raise HTTPException(status_code=429, detail="Too many active holds. Complete or wait for holds to expire.")
+
+CART_ID_REGEX = re.compile(r"^[A-Za-z0-9]{32}$")
+
+def _require_cart_id(request: Request) -> str:
+    # Prefer header, fallback to cookie
+    cid = request.headers.get("X-Cart-Id") or request.cookies.get("cart_id")
+    if not cid or not CART_ID_REGEX.fullmatch(cid):
+        raise HTTPException(status_code=400, detail="Missing or invalid cart id (32 alnum chars).")
+    return cid
+
+def _cart_items_to_cartitemins(db_items: list["CartItem"]) -> list[CartItemIn]:
+    return [
+        CartItemIn(product_id=ci.product_id, qty=ci.qty, color=ci.color, model=ci.model)
+        for ci in db_items
+    ]
+
 
 
 #%% APIs
@@ -1244,3 +1285,80 @@ def spaces_health():
         status = f"error: {type(e).__name__}: {e}"
 
     return {"status": status, "config": cfg}
+
+
+@app.get("/cart", response_model=CartOut, summary="Get cart with priced items")
+def get_cart(request: Request):
+    cid = _require_cart_id(request)
+    with SessionLocal() as db:
+        db_items = db.execute(
+            select(CartItem).where(CartItem.cart_id == cid)
+        ).scalars().all()
+
+    items_in = _cart_items_to_cartitemins(db_items)
+    if not items_in:
+        return CartOut(items=[], subtotal_cents=0, shipping_cents=0, total_cents=0)
+
+    out_items, subtotal, _snap, _idx = validate_and_price(items_in)
+    shipping = compute_shipping(subtotal)
+    return CartOut(items=out_items, subtotal_cents=subtotal, shipping_cents=shipping, total_cents=subtotal + shipping)
+
+
+@app.patch("/cart/items", response_model=CartOut, summary="Add/Set/Remove a cart line")
+def patch_cart_items(p: CartItemPatch, request: Request):
+    cid = _require_cart_id(request)
+
+    with SessionLocal() as db:
+        line = db.execute(
+            select(CartItem).where(
+                CartItem.cart_id == cid,
+                CartItem.product_id == p.product_id,
+                CartItem.color == p.color,
+                CartItem.model == p.model,
+            )
+        ).scalar_one_or_none()
+
+        if p.action == "add":
+            add_qty = max(1, p.qty or 1)
+            if line:
+                line.qty = min(100, line.qty + add_qty)
+            else:
+                db.add(CartItem(cart_id=cid, product_id=p.product_id, color=p.color, model=p.model, qty=add_qty))
+
+        elif p.action == "set":
+            if p.qty <= 0:
+                if line:
+                    db.delete(line)
+            else:
+                if line:
+                    line.qty = p.qty
+                else:
+                    db.add(CartItem(cart_id=cid, product_id=p.product_id, color=p.color, model=p.model, qty=p.qty))
+
+        elif p.action == "remove":
+            if line:
+                db.delete(line)
+
+        db.commit()
+
+        # Re-read for pricing
+        db_items = db.execute(
+            select(CartItem).where(CartItem.cart_id == cid)
+        ).scalars().all()
+
+    items_in = _cart_items_to_cartitemins(db_items)
+    if not items_in:
+        return CartOut(items=[], subtotal_cents=0, shipping_cents=0, total_cents=0)
+
+    out_items, subtotal, _snap, _idx = validate_and_price(items_in)
+    shipping = compute_shipping(subtotal)
+    return CartOut(items=out_items, subtotal_cents=subtotal, shipping_cents=shipping, total_cents=subtotal + shipping)
+
+
+@app.delete("/cart", summary="Empty cart")
+def clear_cart(request: Request):
+    cid = _require_cart_id(request)
+    with SessionLocal() as db:
+        db.query(CartItem).filter(CartItem.cart_id == cid).delete()
+        db.commit()
+    return {"cleared": True}
