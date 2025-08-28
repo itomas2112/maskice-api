@@ -179,7 +179,7 @@ class ProductOut(BaseModel):
 
 class CartItemIn(BaseModel):
     product_id: str
-    qty: conint(ge=1, le=100)
+    qty: int
     color: str
     model: CompatType
 
@@ -1344,21 +1344,62 @@ def get_cart(request: Request):
         total_cents=total,
     )
 
-@app.patch("/cart/items", summary="Update quantity of a cart line")
-def update_cart_item(p: CartItemIn, request: Request):
+@app.post("/cart/items", summary="Create or update a cart line")
+def upsert_cart_item(p: CartItemIn, request: Request):
     cid = _require_cart_id(request)
+
     with SessionLocal() as db:
-        line = db.get(CartItem, {
-            "cart_id": cid,
-            "product_id": p.product_id,
-            "color": p.color,
-            "model": p.model,
-        })
+        # lookup using select(), not Session.get()
+        line = db.execute(
+            select(CartItem).where(
+                CartItem.cart_id == cid,
+                CartItem.product_id == p.product_id,
+                CartItem.color == p.color,
+                CartItem.model == p.model,
+            )
+        ).scalar_one_or_none()
+
+        if line:
+            # update existing
+            line.qty += p.qty
+        else:
+            # create new
+            line = CartItem(
+                cart_id=cid,
+                product_id=p.product_id,
+                color=p.color,
+                model=p.model,
+                qty=p.qty,
+            )
+            db.add(line)
+
+        db.commit()
+        db.refresh(line)
+
+    return {"ok": True, "item_id": line.id if hasattr(line, "id") else None}
+
+@app.patch("/cart/items", summary="Patch quantity of a cart line")
+def patch_cart_item(p: CartItemPatch, request: Request):
+    cid = _require_cart_id(request)
+
+    with SessionLocal() as db:
+        line = db.execute(
+            select(CartItem).where(
+                CartItem.cart_id == cid,
+                CartItem.product_id == p.product_id,
+                CartItem.color == p.color,
+                CartItem.model == p.model,
+            )
+        ).scalar_one_or_none()
+
         if not line:
             raise HTTPException(status_code=404, detail="Cart item not found")
+
         line.qty = p.qty
         db.commit()
-    return {"ok": True}
+        db.refresh(line)
+
+    return {"ok": True, "qty": line.qty}
 
 
 @app.delete("/cart/items/{product_id}/{color}/{model}", summary="Remove a product from cart")
