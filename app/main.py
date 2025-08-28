@@ -331,6 +331,23 @@ class StockReservation(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=sa_func.now())
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
+class CartLineOut(BaseModel):
+    product_id: str
+    color: str
+    model: str
+    qty: int
+    name: str
+    unit_price_cents: int
+    line_total_cents: int
+    image: str   # ← add this
+
+
+class CartSummaryOut(BaseModel):
+    items: List[CartLineOut]
+    subtotal_cents: int  # products only
+    shipping_cents: int  # delivery
+    total_cents: int  # subtotal + shipping
+
 app = FastAPI(title="Maskino API", version="1.0.0")
 
 
@@ -1287,78 +1304,74 @@ def spaces_health():
     return {"status": status, "config": cfg}
 
 
-@app.get("/cart", response_model=CartOut, summary="Get cart with priced items")
+@app.get("/cart", response_model=CartSummaryOut, summary="Get cart with totals")
 def get_cart(request: Request):
     cid = _require_cart_id(request)
-    with SessionLocal() as db:
-        db_items = db.execute(
-            select(CartItem).where(CartItem.cart_id == cid)
-        ).scalars().all()
-
-    items_in = _cart_items_to_cartitemins(db_items)
-    if not items_in:
-        return CartOut(items=[], subtotal_cents=0, shipping_cents=0, total_cents=0)
-
-    out_items, subtotal, _snap, _idx = validate_and_price(items_in)
-    shipping = compute_shipping(subtotal)
-    return CartOut(items=out_items, subtotal_cents=subtotal, shipping_cents=shipping, total_cents=subtotal + shipping)
-
-
-@app.patch("/cart/items", response_model=CartOut, summary="Add/Set/Remove a cart line")
-def patch_cart_items(p: CartItemPatch, request: Request):
-    cid = _require_cart_id(request)
 
     with SessionLocal() as db:
-        line = db.execute(
-            select(CartItem).where(
-                CartItem.cart_id == cid,
-                CartItem.product_id == p.product_id,
-                CartItem.color == p.color,
-                CartItem.model == p.model,
-            )
-        ).scalar_one_or_none()
+        rows = (
+            db.query(CartItem, ProductVar)
+            .join(ProductVar, ProductVar.id == CartItem.product_id)
+            .filter(CartItem.cart_id == cid)
+            .all()
+        )
 
-        if p.action == "add":
-            add_qty = max(1, p.qty or 1)
-            if line:
-                line.qty = min(100, line.qty + add_qty)
-            else:
-                db.add(CartItem(cart_id=cid, product_id=p.product_id, color=p.color, model=p.model, qty=add_qty))
+    items: list[CartLineOut] = []
+    subtotal = 0
 
-        elif p.action == "set":
-            if p.qty <= 0:
-                if line:
-                    db.delete(line)
-            else:
-                if line:
-                    line.qty = p.qty
-                else:
-                    db.add(CartItem(cart_id=cid, product_id=p.product_id, color=p.color, model=p.model, qty=p.qty))
+    for cart_item, product in rows:
+        line_total = product.price_cents * cart_item.qty
+        subtotal += line_total
+        items.append(CartLineOut(
+            product_id=cart_item.product_id,
+            color=cart_item.color,
+            model=cart_item.model,
+            qty=cart_item.qty,
+            name=product.name,
+            unit_price_cents=product.price_cents,
+            line_total_cents=line_total,
+            image=product.image,  # ← here
+        ))
 
-        elif p.action == "remove":
-            if line:
-                db.delete(line)
+    # Delivery rule: 200 cents if subtotal < 2000 (i.e. $20), else free
+    shipping = 0 if subtotal >= 2000 or subtotal == 0 else 200
+    total = subtotal + shipping
 
-        db.commit()
+    return CartSummaryOut(
+        items=items,
+        subtotal_cents=subtotal,
+        shipping_cents=shipping,
+        total_cents=total,
+    )
 
-        # Re-read for pricing
-        db_items = db.execute(
-            select(CartItem).where(CartItem.cart_id == cid)
-        ).scalars().all()
-
-    items_in = _cart_items_to_cartitemins(db_items)
-    if not items_in:
-        return CartOut(items=[], subtotal_cents=0, shipping_cents=0, total_cents=0)
-
-    out_items, subtotal, _snap, _idx = validate_and_price(items_in)
-    shipping = compute_shipping(subtotal)
-    return CartOut(items=out_items, subtotal_cents=subtotal, shipping_cents=shipping, total_cents=subtotal + shipping)
-
-
-@app.delete("/cart", summary="Empty cart")
-def clear_cart(request: Request):
+@app.patch("/cart/items", summary="Update quantity of a cart line")
+def update_cart_item(p: CartItemIn, request: Request):
     cid = _require_cart_id(request)
     with SessionLocal() as db:
-        db.query(CartItem).filter(CartItem.cart_id == cid).delete()
+        line = db.get(CartItem, {
+            "cart_id": cid,
+            "product_id": p.product_id,
+            "color": p.color,
+            "model": p.model,
+        })
+        if not line:
+            raise HTTPException(status_code=404, detail="Cart item not found")
+        line.qty = p.qty
         db.commit()
-    return {"cleared": True}
+    return {"ok": True}
+
+
+@app.delete("/cart/items/{product_id}/{color}/{model}", summary="Remove a product from cart")
+def delete_cart_item(
+    request: Request,
+    product_id: str,
+    color: str,
+    model: str,
+):
+    cid = _require_cart_id(request)
+    with SessionLocal() as db:
+        line = db.get(CartItem, (cid, product_id, color, model))  # ← tuple, not dict
+        if line:
+            db.delete(line)
+            db.commit()
+    return {"ok": True}
