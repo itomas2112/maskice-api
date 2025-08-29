@@ -13,6 +13,7 @@ from app.schemas.types import (
 )
 from app.utils.slugify import slugify
 from app.services.spaces import upload_to_spaces, spaces_key_for, public_url_for, guess_content_type
+from app.api.deps import require_admin
 
 router = APIRouter()
 
@@ -55,7 +56,7 @@ def list_products(compat: CompatType | None = Query(default=None), db: Session =
 
     return out
 
-@router.post("/product", summary="Create ONE product row (drag&drop upload or URL)")
+@router.post("/product", dependencies=[Depends(require_admin)])
 async def create_single_product_multipart(
     id: str | None = Form(None),
     name: str = Form(...),
@@ -111,7 +112,7 @@ async def create_single_product_multipart(
         "quantity": int(quantity),
     }
 
-@router.patch("/product/{id}/{colors}/{compat}", summary="Update ONE product row (by composite key); optionally replace image")
+@router.patch("/product/{id}/{colors}/{compat}", dependencies=[Depends(require_admin)])
 async def update_product_variant(
     id: str = Path(...),
     colors: str = Path(...),
@@ -162,7 +163,7 @@ async def update_product_variant(
         "quantity": row.quantity,
     }
 
-@router.delete("/product/{id}/{colors}/{compat}", summary="Delete ONE product row (by composite key)")
+@router.delete("/product/{id}/{colors}/{compat}", dependencies=[Depends(require_admin)])
 def delete_product_variant(id: str, colors: str, compat: CompatType, db: Session = Depends(get_db)):
     row = db.get(ProductVar, {"id": id, "colors": colors, "compat": compat})
     if not row:

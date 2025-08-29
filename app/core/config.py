@@ -32,3 +32,10 @@ SPACES_CDN_BASE = (os.getenv("SPACES_CDN_BASE") or "").rstrip("/")
 
 # Stock reservations
 RES_HOLD_MINUTES = int(os.getenv("RES_HOLD_MINUTES", "15"))
+
+#Login
+JWT_SECRET = os.getenv("JWT_SECRET", "dev-secret-change-me")
+JWT_ALGORITHM = "HS256"
+JWT_EXPIRES_MIN = int(os.getenv("JWT_EXPIRES_MIN", "60"))
+COOKIE_SECURE = os.getenv("COOKIE_SECURE", "true").lower() == "true"
+COOKIE_DOMAIN = os.getenv("COOKIE_DOMAIN") or None

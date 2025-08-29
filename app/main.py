@@ -8,6 +8,7 @@ from app.api.routes.orders import router as orders_router
 from app.api.routes.lookups import router as lookups_router
 from app.api.routes.stripe_webhook import router as stripe_router
 from app.api.routes.debug import router as debug_router
+from app.api.routes.auth import router as auth_router
 
 app = FastAPI(title="Maskino API", version="1.0.0")
 
@@ -30,3 +31,4 @@ app.include_router(orders_router)
 app.include_router(lookups_router)
 app.include_router(stripe_router)
 app.include_router(debug_router)
+app.include_router(auth_router)
