@@ -10,21 +10,31 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 
 COOKIE_NAME = "access_token"
 
+def _cookie_samesite() -> str:
+    # Cross-site requires SameSite=None and Secure=true
+    return "none" if COOKIE_SECURE else "lax"
+
 def set_login_cookie(response: Response, token: str):
     response.set_cookie(
         key=COOKIE_NAME,
         value=token,
         httponly=True,
         secure=COOKIE_SECURE,
-        samesite="lax",
+        samesite=_cookie_samesite(),
         domain=COOKIE_DOMAIN,
         path="/",
         max_age=60 * 60 * 24 * 7,
     )
 
 def clear_login_cookie(response: Response):
-    response.delete_cookie(COOKIE_NAME, domain=COOKIE_DOMAIN, path="/")
-
+    # Use the same attributes to ensure deletion works in Chrome
+    response.delete_cookie(
+        key=COOKIE_NAME,
+        domain=(COOKIE_DOMAIN or None),
+        path="/",
+        secure=COOKIE_SECURE,
+        samesite=_cookie_samesite(),
+    )
 @router.post("/login", response_model=TokenOut)
 def login(body: LoginIn, response: Response, db: Session = Depends(get_db)):
     user = db.get(User, body.username)
