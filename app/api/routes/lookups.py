@@ -7,8 +7,11 @@ from sqlalchemy.exc import IntegrityError
 from app.db.session import get_db
 from app.models.entities import TypeRow, PhoneRow, SubphoneRow
 from app.schemas.types import TypeOut, PhoneOut, SubphoneOut, TypeIn, PhoneIn, SubphoneIn
+from app.api.deps import require_admin   # 👈 add this
 
 router = APIRouter()
+
+router = APIRouter(dependencies=[Depends(require_admin)])
 
 @router.get("/types", response_model=list[TypeOut], summary="List all product types")
 def list_types(db: Session = Depends(get_db)):

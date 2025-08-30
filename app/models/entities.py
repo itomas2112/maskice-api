@@ -1,9 +1,10 @@
 
 import uuid
 from datetime import datetime
-from sqlalchemy import Text, Integer, DateTime, ForeignKey, Index
+from sqlalchemy import Text, Integer, DateTime, ForeignKey, Index, String
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.sql import func as sa_func
+from typing import Optional
 
 from app.models.base import Base
 
@@ -45,6 +46,7 @@ class Order(Base):
     ship_city: Mapped[str | None] = mapped_column(Text, nullable=True)
     ship_postal_code: Mapped[str | None] = mapped_column(Text, nullable=True)
     ship_country: Mapped[str | None] = mapped_column(Text, nullable=True)
+    client_ip: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
 
 class OrderItem(Base):
     __tablename__ = "order_items"
