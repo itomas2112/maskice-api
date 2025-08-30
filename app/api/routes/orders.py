@@ -76,7 +76,7 @@ def mark_order_complete(order_id: str, db: Session = Depends(get_db)):
         order.complete = 1
         final_order_statues = 1
         db.commit()
-    if order.complete == 1:
+    elif order.complete == 1:
         order.complete = 0
         final_order_statues = 0
         db.commit()
@@ -234,6 +234,7 @@ def create_checkout_session(payload: CheckoutPayload, request: Request, db: Sess
             metadata={"order_id": order_id},
             payment_intent_data={"metadata": {"order_id": order_id}},
             expires_at=int(time.time()) + expires_seconds,
+            customer_email=payload.customer.email
         )
 
         # Save session id on the order
