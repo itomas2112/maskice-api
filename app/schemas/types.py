@@ -1,9 +1,9 @@
 
 from typing import List, Literal, Optional
 from enum import Enum as PyEnum
-from pydantic import BaseModel, conint, EmailStr
+from pydantic import BaseModel, conint, EmailStr, constr
 
-CompatType = Literal["iPhone 16", "iPhone 16 Pro"]
+CompatType = constr(strip_whitespace=True, min_length=1)
 
 class ProductVariantOut(BaseModel):
     product_id: str
