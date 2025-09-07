@@ -64,6 +64,12 @@ def list_orders(status: str | None = Query(default=None), limit: int = Query(100
             created_at=str(order.created_at) if getattr(order, "created_at", None) else None,
             complete=order.complete,
             items=[OrderItemOut.model_validate(x, from_attributes=True) for x in order.items],
+            customer_first_name=order.customer_first_name,
+            customer_last_name=order.customer_last_name,
+            customer_email=order.customer_email,
+            ship_address_line_1=order.ship_address_line1,
+            ship_city=order.ship_city,
+            ship_postal_code=order.ship_postal_code,
         ))
     return out
 

@@ -83,6 +83,12 @@ class OrderListItemOut(BaseModel):
     created_at: str | None = None
     complete: int
     items: list[OrderItemOut]
+    customer_first_name: str
+    customer_last_name: str
+    customer_email: str
+    ship_address_line_1: str
+    ship_city: str
+    ship_postal_code: str
     class Config: from_attributes = True
 
 class OrderOut(BaseModel):
