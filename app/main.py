@@ -15,12 +15,14 @@ fr1 = os.getenv("frontend1")
 fr2 = os.getenv("frontend2")
 fr3 = os.getenv("frontend3")
 fr4 = os.getenv("frontend4")
+fr5 = os.getenv("frontend5")
+fr6 = os.getenv("frontend6")
 
 app = FastAPI(title="Maskino API", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[fr1,fr2, fr3, fr4],
+    allow_origins=[fr1,fr2, fr3, fr4, fr5, fr6],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
