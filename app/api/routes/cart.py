@@ -2,6 +2,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.orm import Session
 from sqlalchemy import select
+from sqlalchemy import delete as sa_delete
 
 from app.db.session import get_db
 from app.api.deps import require_cart_id
@@ -97,4 +98,12 @@ def delete_cart_item(request: Request, product_id: str, color: str, model: str, 
     if line:
         db.delete(line)
         db.commit()
+    return {"ok": True}
+
+@router.delete("/cart", summary="Clear entire cart")
+def clear_cart(request: Request, db: Session = Depends(get_db)):
+    cid = require_cart_id(request)
+    # SQLAlchemy 1.4/2.0 compatible bulk delete:
+    db.execute(sa_delete(CartItem).where(CartItem.cart_id == cid))
+    db.commit()
     return {"ok": True}
